@@ -9,6 +9,37 @@ extern const EpdWaveform MY_WAVEFORM;
 void my_waveform_init(void);
 // Balanced: trimmed GC/GL (36/37 phases), unchanged DU; NULL if unavailable.
 const EpdWaveform* my_waveform_fast(void);
+// Tunable 16-level GC, for calibrating gray levels on the glass. Every pixel
+// that changes is first cleared to white and then driven to its level from
+// white, so each level is defined by its own three numbers. levels[] is
+// indexed by gray level, 0 = black .. 15 = white:
+//   black: frames pushed toward black from white
+//   pull:  frames pushed back toward white after that
+//   clear: frames pushed toward white to clear a pixel at this level
+// Unchanged gray pixels are not driven. levels[15] is white and holds the
+// top-up for unchanged pixels instead: `pull` white frames for one that stays
+// white, `black` black frames for one that stays black, so that untouched
+// white and black keep up with freshly driven white and black. Its `clear`
+// chooses the timing: 0 draws every level only after the clearing has ended;
+// nonzero draws a pixel that was white while the others clear, the two ending
+// together, so the old screen fades as the new one appears.
+#define MY_WAVEFORM_HAS_TUNED 1
+typedef struct {
+    uint8_t black;
+    uint8_t pull;
+    uint8_t clear;
+} my_tuned_level_t;
+// Builds the table; returns its phase count, or 0 (table unchanged) when it
+// would exceed MY_TUNED_MAX_PHASES or cannot be allocated. Never call while a
+// frame is being drawn.
+#define MY_TUNED_MAX_PHASES 64
+int my_waveform_tuned_set(const my_tuned_level_t levels[16]);
+// The balanced GC's own numbers: its pushes from white to each level, and the
+// white pushes of its transition from each level to white (it also pushes
+// toward black before those, which this table has no number for).
+void my_waveform_tuned_defaults(my_tuned_level_t levels[16]);
+// NULL until my_waveform_tuned_set() has succeeded.
+const EpdWaveform* my_waveform_tuned(void);
 // Sleep settling: two black-only phases and a hold; white/gray targets are untouched.
 const EpdWaveform* my_waveform_black_settle(void);
 // Extreme: 30-phase, 8-gray GL only; GC uses the 16-gray profiles.

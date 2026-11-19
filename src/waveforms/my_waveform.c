@@ -186,6 +186,98 @@ static void gc16_adjust_endpoint_transitions(uint8_t (*data)[16][4], int frames)
     }
 }
 
+// --- tunable 16-level GC (see my_waveform.h) ---
+static EpdWaveformPhases s_tuned_phases = { .phases = 0 };
+static const EpdWaveformPhases* s_tuned_ranges[] = { &s_tuned_phases };
+static const EpdWaveformMode s_tuned_mode = {
+    .type = 2, .temp_ranges = 1, .range_data = s_tuned_ranges,
+};
+static const EpdWaveformMode* s_tuned_modes[] = { &s_tuned_mode };
+static const EpdWaveform s_tuned_waveform = {
+    .num_modes = 1, .num_temp_ranges = 1,
+    .mode_data = s_tuned_modes, .temp_intervals = my_waveform_intervals,
+};
+static uint8_t (*s_tuned_data)[16][4];
+
+const EpdWaveform* my_waveform_tuned(void) {
+    return s_tuned_phases.phases > 0 ? &s_tuned_waveform : NULL;
+}
+
+#define MY_TUNED_HOLD 2
+
+int my_waveform_tuned_set(const my_tuned_level_t levels[16]) {
+    if (levels == NULL) return 0;
+    // Stage one clears to white, stage two draws from white; each is as long
+    // as its longest transition.
+    const int white_top_up = levels[15].pull;
+    const int black_top_up = levels[15].black;
+    int clear_len = white_top_up > black_top_up ? white_top_up : black_top_up;
+    int draw_len = black_top_up;
+    for (int level = 0; level < 15; ++level) {
+        if (levels[level].clear > clear_len) clear_len = levels[level].clear;
+        if (levels[level].black + levels[level].pull > draw_len) {
+            draw_len = levels[level].black + levels[level].pull;
+        }
+    }
+    const int phases = clear_len + draw_len + MY_TUNED_HOLD;
+    if (phases > MY_TUNED_MAX_PHASES) return 0;
+    if (!s_tuned_data) {
+        s_tuned_data = heap_caps_malloc(
+            (size_t)MY_TUNED_MAX_PHASES * 16 * 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_tuned_data) return 0;
+    }
+    memset(s_tuned_data, 0, (size_t)MY_TUNED_MAX_PHASES * 16 * 4);
+    const bool overlap = levels[15].clear != 0;
+    // Top-ups run with the stage that drives the same way, ending with it.
+    // Overlapped, a pixel that was white is drawn inside the clearing stage.
+    for (int i = 0; i < white_top_up; ++i) lut_or(s_tuned_data, clear_len - 1 - i, 15, 15, 2);
+    for (int i = 0; i < black_top_up; ++i) {
+        lut_or(s_tuned_data, (overlap ? clear_len : clear_len + draw_len) - 1 - i, 0, 0, 1);
+    }
+    for (int to = 0; to < 16; ++to) {
+        for (int from = 0; from < 16; ++from) {
+            if (from == to) continue;
+            if (from != 15) {
+                // Clear, ending with the stage so everything turns white together.
+                int f = clear_len - levels[from].clear;
+                for (int i = 0; i < levels[from].clear; ++i) lut_or(s_tuned_data, f++, to, from, 2);
+            }
+            if (to != 15) {
+                const int length = levels[to].black + levels[to].pull;
+                int f = clear_len;
+                if (overlap && from == 15) f = clear_len > length ? clear_len - length : 0;
+                for (int i = 0; i < levels[to].black; ++i) lut_or(s_tuned_data, f++, to, from, 1);
+                for (int i = 0; i < levels[to].pull; ++i) lut_or(s_tuned_data, f++, to, from, 2);
+            }
+        }
+    }
+    s_tuned_phases.luts = (const uint8_t*)s_tuned_data;
+    s_tuned_phases.phases = phases;
+    return phases;
+}
+
+void my_waveform_tuned_defaults(my_tuned_level_t levels[16]) {
+    const EpdWaveformPhases* src = s_fast_gc_phases.luts ? &s_fast_gc_phases : &s_gc16_phases;
+    const uint8_t (*data)[16][4] = (const uint8_t (*)[16][4])src->luts;
+    memset(levels, 0, 16 * sizeof(levels[0]));
+    for (int level = 0; level < 15; ++level) {
+        int black = 0, pull = 0, clear = 0;
+        for (int f = 0; f < src->phases; ++f) {
+            // From white: every black push, and the white pushes that follow them.
+            const int draw = lut_get(data, f, level, 15);
+            if (draw == 1) black++;
+            if (draw == 2 && black > 0) pull++;
+            if (lut_get(data, f, 15, level) == 2) clear++;
+        }
+        levels[level].black = (uint8_t)black;
+        levels[level].pull = (uint8_t)pull;
+        levels[level].clear = (uint8_t)clear;
+    }
+    // Its unchanged white and black each get two frames (gc16_reinforce_same_color).
+    levels[15].pull = 2;
+    levels[15].black = 2;
+}
+
 // Two black-only settling phases and a final hold; other targets are untouched.
 static uint8_t s_black_settle_data[3][16][4];
 static const EpdWaveformPhases s_black_settle_phases = {
