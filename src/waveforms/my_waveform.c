@@ -257,7 +257,11 @@ int my_waveform_tuned_set(const my_tuned_level_t levels[16]) {
     for (int to = 0; to < 16; ++to) {
         for (int from = 0; from < 16; ++from) {
             if (from == to) continue;
-            if (from != 15) {
+            // Pure black with no pullback (pull == 0) saturates directly from
+            // intermediate grays; clearing gray to white first causes white-polarization
+            // rebound and leaves light outlines inside solid black controls.
+            const bool direct_black = (to == 0 && levels[0].pull == 0);
+            if (from != 15 && !direct_black) {
                 // Clear, ending with the stage so everything turns white together.
                 int f = clear_len - levels[from].clear;
                 for (int i = 0; i < levels[from].clear; ++i) lut_or(s_tuned_data, f++, to, from, 2);
@@ -265,10 +269,8 @@ int my_waveform_tuned_set(const my_tuned_level_t levels[16]) {
             if (to != 15) {
                 const int length = levels[to].black + levels[to].pull;
                 int f = clear_len;
-                if (overlap && from == 15) {
+                if (overlap && (from == 15 || direct_black)) {
                     f = clear_len > length ? clear_len - length : 0;
-                } else if (overlap) {
-                    f = clear_len + draw_len - length;
                 }
                 for (int i = 0; i < levels[to].black; ++i) lut_or(s_tuned_data, f++, to, from, 1);
                 for (int i = 0; i < levels[to].pull; ++i) lut_or(s_tuned_data, f++, to, from, 2);
