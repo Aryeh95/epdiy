@@ -1254,7 +1254,7 @@ void epd_lcd_set_pixel_clock_MHz(int frequency) {
         const int high_ticks = (data_clocks + cycles_per_tick - 1) / cycles_per_tick;
         const int minimum_low_ticks = lcd.ckv_tick_hz / 1000000;
         const int minimum_cycles = data_clocks + lcd.config.dummy_clocks_after_data;
-        const int period_ticks = max(high_ticks + minimum_low_ticks,
+        const int period_ticks = max(high_ticks + minimum_low_ticks + 1,
             (minimum_cycles + cycles_per_tick - 1) / cycles_per_tick);
         // Share exact sub-microsecond period between LCD and RMT without drift.
         lcd.ckv_period_ticks = period_ticks;
@@ -1443,9 +1443,7 @@ void IRAM_ATTR epd_lcd_start_frame() {
     start_ckv_cycles(initial_lines + 5);
     esp_rom_delay_us(lcd.ckv_period_us);
     gpio_set_level(lcd.config.bus.stv, 1);
-#if !defined(CONFIG_IDF_TARGET_ESP32S31)
     esp_rom_delay_us(lcd.ckv_period_us);
-#endif
     esp_rom_delay_us(lcd.config.ckv_high_time / 10);
 
     // start LCD engine

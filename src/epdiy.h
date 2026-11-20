@@ -623,6 +623,11 @@ void epd_draw_rotated_transparent_image(
  */
 void epd_set_lcd_pixel_clock_MHz(int frequency);
 
+/**
+ * Read average, minimum and maximum phase-to-phase periods (in us) from the last LCD update.
+ */
+void epd_lcd_get_timing(int* average, int* minimum, int* maximum);
+
 #ifdef __cplusplus
 }
 #endif

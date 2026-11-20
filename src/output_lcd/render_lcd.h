@@ -17,3 +17,8 @@ void lcd_do_update(RenderContext_t* ctx);
  * In LCD mode, both threads do the same thing.
  */
 void lcd_calculate_frame(RenderContext_t* ctx, int thread_id);
+
+/**
+ * Read average, minimum and maximum phase-to-phase periods (in us) from the last update.
+ */
+void epd_lcd_get_timing(int* average, int* minimum, int* maximum);
