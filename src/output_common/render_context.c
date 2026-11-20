@@ -88,6 +88,7 @@ void IRAM_ATTR prepare_context_for_next_frame(RenderContext_t* ctx) {
     else ctx->lut_build_func(ctx->conversion_lut, phases, ctx->current_frame);
 
     ctx->lines_prepared = 0;
+#if !defined(RENDER_METHOD_LCD)
     ctx->lines_consumed = 0;
     if (ctx->line_ready) memset(ctx->line_ready,0,ctx->lines_total);
     if (ctx->line_threads != NULL) {
@@ -95,6 +96,7 @@ void IRAM_ATTR prepare_context_for_next_frame(RenderContext_t* ctx) {
             ctx->line_threads[i] = (uint8_t)(i % NUM_RENDER_THREADS);
         }
     }
+#endif
 }
 
 void epd_populate_line_mask(uint8_t* line_mask, const uint8_t* dirty_columns, int mask_len) {
