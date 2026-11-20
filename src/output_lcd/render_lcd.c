@@ -94,9 +94,10 @@ static void IRAM_ATTR handle_lcd_frame_done(RenderContext_t* ctx) {
     portYIELD_FROM_ISR();
 }
 
-// Pace phase starts along a fixed 85 Hz timeline so a late phase does not push all following phases.
+// Pace phase starts along a fixed 62 Hz (~16.1 ms/phase) grid matching CrossPoint's calibrated
+// Metalio Plus gray tables while preventing late phases from delaying subsequent ones.
 #ifndef EPD_PHASE_HZ
-#define EPD_PHASE_HZ 85
+#define EPD_PHASE_HZ 62
 #endif
 static int s_prefill_lines = 192;
 static StaticSemaphore_t s_scan_lock_storage;

@@ -361,7 +361,7 @@ void my_waveform_init(void) {
     s_fast_gc_phases.luts = (const uint8_t*)data;
     s_fast_gl_phases.luts = (const uint8_t*)(data + MY_FULL_GC16_FRAMES);
 
-    // Build clean-room cross-fade reader table in PSRAM from trimmed GL16.
+    // Build clean-room right-aligned cross-fade reader table in PSRAM from trimmed GL16.
     uint8_t (*reader)[16][4] = heap_caps_calloc(
         (size_t)gl, sizeof(reader[0]), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!reader) {
@@ -369,40 +369,61 @@ void my_waveform_init(void) {
         return;
     }
     const uint8_t (*src_gl)[16][4] = (const uint8_t (*)[16][4])s_fast_gl_phases.luts;
-    int max_active = 0;
-    for (int to = 0; to < 16; ++to) {
-        for (int from = 0; from < 16; ++from) {
-            if (to == from) continue;
-            uint8_t seq[MY_FULL_GL16_FRAMES];
-            for (int f = 0; f < gl; ++f) {
-                seq[f] = (uint8_t)lut_get(src_gl, f, to, from);
-            }
-            int a = 0;
-            while (a < gl && seq[a] == 0) ++a;
-            int z = gl;
-            while (z > a && seq[z - 1] == 0) --z;
-            if (to < 15) {
-                // Dark/gray targets darken directly without pre-erasing to white.
-                while (a < z && seq[a] == 2) ++a;
-            }
-            const int len = z - a;
-            for (int i = 0; i < len; ++i) {
-                if (seq[a + i] != 0) {
-                    lut_or(reader, i, to, from, seq[a + i]);
+    int longest = 10;  // Reserve at least 10 phases for 0 -> 0 black retention.
+    int reader_phases = 0;
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 1) {
+            reader_phases = longest + MY_TRIM_HOLD;
+            if (reader_phases > gl) reader_phases = gl;
+        }
+        for (int to = 0; to < 16; ++to) {
+            for (int from = 0; from < 16; ++from) {
+                if (to == from) continue;
+                uint8_t seq[MY_FULL_GL16_FRAMES];
+                for (int f = 0; f < gl; ++f) {
+                    seq[f] = (uint8_t)lut_get(src_gl, f, to, from);
+                }
+                int a = 0;
+                while (a < gl && seq[a] == 0) ++a;
+                int z = gl;
+                while (z > a && seq[z - 1] == 0) --z;
+                if (to == 0) {
+                    // Pure black targets darken directly without pre-erasing to white.
+                    while (a < z && seq[a] == 2) ++a;
+                } else if (to == 15) {
+                    // Pure white targets clear directly without pre-flashing toward black.
+                    while (a < z && seq[a] == 1) ++a;
+                }
+                // Intermediate gray targets (1..14) keep full pre-erase for gray accuracy.
+                const int len = z - a;
+                if (pass == 0) {
+                    if (len > longest) longest = len;
+                } else {
+                    const int start = longest - len;
+                    for (int i = 0; i < len; ++i) {
+                        if (seq[a + i] != 0 && start + i >= 0 && start + i < reader_phases) {
+                            lut_or(reader, start + i, to, from, seq[a + i]);
+                        }
+                    }
                 }
             }
-            if (len > max_active) max_active = len;
         }
     }
-    // Retained black (0 -> 0): 5 erase + 5 darken to prevent fading across page turns.
-    for (int f = 0; f < 5 && f < gl; ++f) lut_or(reader, f, 0, 0, 2);
-    for (int f = 5; f < 10 && f < gl; ++f) lut_or(reader, f, 0, 0, 1);
-    if (max_active < 10) max_active = 10;
-    int reader_phases = max_active + MY_TRIM_HOLD;
-    if (reader_phases > gl) reader_phases = gl;
+    // Retained black (0 -> 0): 5 erase + 5 darken right-aligned before the final hold phases.
+    const int keep_start = longest - 10;
+    for (int i = 0; i < 5; ++i) {
+        if (keep_start + i >= 0 && keep_start + i < reader_phases) {
+            lut_or(reader, keep_start + i, 0, 0, 2);
+        }
+    }
+    for (int i = 5; i < 10; ++i) {
+        if (keep_start + i >= 0 && keep_start + i < reader_phases) {
+            lut_or(reader, keep_start + i, 0, 0, 1);
+        }
+    }
     s_reader_gl_phases.phases = reader_phases;
     s_reader_gl_phases.luts = (const uint8_t*)reader;
-    ESP_LOGI(TAG, "reader waveform initialized (%d phases)", reader_phases);
+    ESP_LOGI(TAG, "reader waveform initialized (%d phases, longest=%d)", reader_phases, longest);
 }
 
 // Extreme GL uses eight optical grays; GC always uses the 16-gray profiles.
