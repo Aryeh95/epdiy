@@ -154,6 +154,26 @@ const EpdWaveform* my_waveform_fast(void) {
     return s_fast_gc_phases.luts ? &s_fast_waveform : NULL;
 }
 
+static EpdWaveformPhases s_reader_gl_phases = { .phases = 0 };
+static const EpdWaveformPhases* s_reader_gl_ranges[] = { &s_reader_gl_phases };
+static const EpdWaveformMode s_reader_gl_mode = {
+    .type = 5, .temp_ranges = 1, .range_data = s_reader_gl_ranges,
+};
+static const EpdWaveformMode s_reader_gc_mode = {
+    .type = 2, .temp_ranges = 1, .range_data = s_reader_gl_ranges,
+};
+static const EpdWaveformMode* s_reader_modes[] = {
+    &s_du_mode, &s_reader_gc_mode, &s_reader_gl_mode,
+};
+static const EpdWaveform s_reader_waveform = {
+    .num_modes = 3, .num_temp_ranges = 1,
+    .mode_data = s_reader_modes, .temp_intervals = my_waveform_intervals,
+};
+
+const EpdWaveform* my_waveform_reader(void) {
+    return s_reader_gl_phases.luts && s_reader_gl_phases.phases > 0 ? &s_reader_waveform : NULL;
+}
+
 // Reinforce both unchanged endpoints twice to reduce transition residue.
 static void gc16_reinforce_same_color(uint8_t (*data)[16][4], int frames) {
     assert(frames >= 3);
@@ -245,7 +265,11 @@ int my_waveform_tuned_set(const my_tuned_level_t levels[16]) {
             if (to != 15) {
                 const int length = levels[to].black + levels[to].pull;
                 int f = clear_len;
-                if (overlap && from == 15) f = clear_len > length ? clear_len - length : 0;
+                if (overlap && from == 15) {
+                    f = clear_len > length ? clear_len - length : 0;
+                } else if (overlap) {
+                    f = clear_len + draw_len - length;
+                }
                 for (int i = 0; i < levels[to].black; ++i) lut_or(s_tuned_data, f++, to, from, 1);
                 for (int i = 0; i < levels[to].pull; ++i) lut_or(s_tuned_data, f++, to, from, 2);
             }
@@ -336,6 +360,49 @@ void my_waveform_init(void) {
     gl16_white_tick(data + MY_FULL_GC16_FRAMES, gl);
     s_fast_gc_phases.luts = (const uint8_t*)data;
     s_fast_gl_phases.luts = (const uint8_t*)(data + MY_FULL_GC16_FRAMES);
+
+    // Build clean-room cross-fade reader table in PSRAM from trimmed GL16.
+    uint8_t (*reader)[16][4] = heap_caps_calloc(
+        (size_t)gl, sizeof(reader[0]), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!reader) {
+        ESP_LOGW(TAG, "reader waveform allocation failed; fast GC16 retained");
+        return;
+    }
+    const uint8_t (*src_gl)[16][4] = (const uint8_t (*)[16][4])s_fast_gl_phases.luts;
+    int max_active = 0;
+    for (int to = 0; to < 16; ++to) {
+        for (int from = 0; from < 16; ++from) {
+            if (to == from) continue;
+            uint8_t seq[MY_FULL_GL16_FRAMES];
+            for (int f = 0; f < gl; ++f) {
+                seq[f] = (uint8_t)lut_get(src_gl, f, to, from);
+            }
+            int a = 0;
+            while (a < gl && seq[a] == 0) ++a;
+            int z = gl;
+            while (z > a && seq[z - 1] == 0) --z;
+            if (to < 15) {
+                // Dark/gray targets darken directly without pre-erasing to white.
+                while (a < z && seq[a] == 2) ++a;
+            }
+            const int len = z - a;
+            for (int i = 0; i < len; ++i) {
+                if (seq[a + i] != 0) {
+                    lut_or(reader, i, to, from, seq[a + i]);
+                }
+            }
+            if (len > max_active) max_active = len;
+        }
+    }
+    // Retained black (0 -> 0): 5 erase + 5 darken to prevent fading across page turns.
+    for (int f = 0; f < 5 && f < gl; ++f) lut_or(reader, f, 0, 0, 2);
+    for (int f = 5; f < 10 && f < gl; ++f) lut_or(reader, f, 0, 0, 1);
+    if (max_active < 10) max_active = 10;
+    int reader_phases = max_active + MY_TRIM_HOLD;
+    if (reader_phases > gl) reader_phases = gl;
+    s_reader_gl_phases.phases = reader_phases;
+    s_reader_gl_phases.luts = (const uint8_t*)reader;
+    ESP_LOGI(TAG, "reader waveform initialized (%d phases)", reader_phases);
 }
 
 // Extreme GL uses eight optical grays; GC always uses the 16-gray profiles.

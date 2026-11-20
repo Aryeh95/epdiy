@@ -30,6 +30,16 @@ stays LGPL-3.0, as does this fork (`LICENSE`).
   symbol.
 - `library.json`: the upstream board files and the I2S output are left out of
   the build.
+- Synced upstream fixes from `CloudZao/Metalio-E-INK4-Plus@fd3fa033` (MIT / LGPL-3.0):
+  - `src/waveforms/my_waveform_trim.c`: two-pass stack-local trimming (~17 KB DRAM freed).
+  - `src/output_lcd/lcd_driver.{c,h}`: S31 native 684 scan lines, `dummy_bytes=0`, exact `ckv_period_ticks`, IPC-safe `epd_lcd_abort_frame()`, AXI-DMA EOF gate, `spv_start_us`.
+  - `src/output_lcd/render_lcd.c` & `src/output_common/render_context.h`: semaphore-driven phase lookahead (`feed_space`, `prefill_done`, 85 Hz grid, `line_mask_active`).
+  - `src/epdiy.h`, `src/output_common/lut.c`, `src/highlevel.c`: `gl16_changed_phase()` and `MODE_EQUALIZE_BLACK` (including S31 64K pixel-pair paths).
+- Clean-room additions:
+  - `src/waveforms/my_waveform.{c,h}`: cross-fade `my_waveform_reader()` profile and completion-locked non-white stroke timing in `my_waveform_tuned_set()`.
+  - `src/output_lcd/lcd_driver.c`: GDMA priority `5`, stale bounce-refill stats (`epd_lcd_get_stale_stats`), IDF 6.1 LCD core clock selection, clock-tree refcount disable pairs, and rollback-safe `epd_lcd_init_checked()`.
+  - `src/highlevel.c` & `src/epd_highlevel.h`: column-masked `update_region()` and `epd_hl_update_area_full()`.
+  - `src/render.c`: static `DRAM_ATTR` scratch buffers for `MODE_SPATIAL_WIPE_GL`.
 
 ## Compliance
 

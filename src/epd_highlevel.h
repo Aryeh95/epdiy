@@ -146,6 +146,14 @@ enum EpdDrawError epd_hl_update_area(
 );
 
 /**
+ * Update all pixels within an area unconditionally (column/row masked, skipping
+ * MODE_SKIP_UNCHANGED) to clear ghosting inside a partial UI region.
+ */
+enum EpdDrawError epd_hl_update_area_full(
+    EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area
+);
+
+/**
  * Reset the front framebuffer to a white state.
  *
  * @param state: A reference to the `EpdiyHighlevelState` object used.

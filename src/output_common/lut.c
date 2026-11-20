@@ -458,6 +458,31 @@ static void IRAM_ATTR changed_only_phase(
     }
 }
 
+static void IRAM_ATTR gl16_changed_phase(
+    uint8_t data[16][4], const EpdWaveformPhases* phases, int frame
+) {
+    changed_only_phase(data, phases, frame, false);
+    // Pure-black targets keep darkening pulses and strip erase-to-white to avoid flashing.
+    for (unsigned packed = 0; packed < 4; ++packed) data[0][packed] &= 0x55;
+
+    // Reinforce 0->0 during the last 4 white->black push phases without extending the scan.
+    if ((phases->luts[frame * 16 * 4 + 3] & 3) != 1) return;
+    unsigned remaining = 0;
+    for (int phase = frame; phase < phases->phases; ++phase) {
+        if ((phases->luts[phase * 16 * 4 + 3] & 3) == 1 && ++remaining > 4) return;
+    }
+    data[0][0] |= 0x40;
+}
+
+static void IRAM_ATTR equalize_black_phase(
+    uint8_t data[16][4], const EpdWaveformPhases* phases, int frame
+) {
+    changed_only_phase(data, phases, frame, false);
+    // Drive all pure-black targets (to == 0) using the waveform's white->black push schedule.
+    const unsigned action = phases->luts[frame * 16 * 4 + 3] & 3;
+    memset(data[0], action == 1 ? 0x55 : 0, sizeof(data[0]));
+}
+
 static void IRAM_ATTR build_changed_1ppB_lut_S3_VE_1k(
     uint8_t* lut, const EpdWaveformPhases* phases, int frame
 ) {
@@ -493,6 +518,46 @@ static void IRAM_ATTR build_du_1ppB_lut_64k(
 ) {
     uint8_t data[16][4];
     changed_only_phase(data, phases, frame, true);
+    EpdWaveformPhases phase = *phases;
+    phase.luts = (const uint8_t*)data;
+    build_1ppB_lut_64k(lut, &phase, 0);
+}
+
+static void IRAM_ATTR build_gl16_1ppB_lut_S3_VE_1k(
+    uint8_t* lut, const EpdWaveformPhases* phases, int frame
+) {
+    uint8_t data[16][4];
+    gl16_changed_phase(data, phases, frame);
+    EpdWaveformPhases phase = *phases;
+    phase.luts = (const uint8_t*)data;
+    build_1ppB_lut_S3_VE_1k(lut, &phase, 0);
+}
+
+static void IRAM_ATTR build_gl16_1ppB_lut_64k(
+    uint8_t* lut, const EpdWaveformPhases* phases, int frame
+) {
+    uint8_t data[16][4];
+    gl16_changed_phase(data, phases, frame);
+    EpdWaveformPhases phase = *phases;
+    phase.luts = (const uint8_t*)data;
+    build_1ppB_lut_64k(lut, &phase, 0);
+}
+
+static void IRAM_ATTR build_equalize_black_1ppB_lut_S3_VE_1k(
+    uint8_t* lut, const EpdWaveformPhases* phases, int frame
+) {
+    uint8_t data[16][4];
+    equalize_black_phase(data, phases, frame);
+    EpdWaveformPhases phase = *phases;
+    phase.luts = (const uint8_t*)data;
+    build_1ppB_lut_S3_VE_1k(lut, &phase, 0);
+}
+
+static void IRAM_ATTR build_equalize_black_1ppB_lut_64k(
+    uint8_t* lut, const EpdWaveformPhases* phases, int frame
+) {
+    uint8_t data[16][4];
+    equalize_black_phase(data, phases, frame);
     EpdWaveformPhases phase = *phases;
     phase.luts = (const uint8_t*)data;
     build_1ppB_lut_64k(lut, &phase, 0);
@@ -543,6 +608,18 @@ static void IRAM_ATTR build_du_1ppB_pairs_s31(uint8_t* lut, const EpdWaveformPha
     expand_1k_to_pairs_s31(lut);
 }
 
+static void IRAM_ATTR build_gl16_1ppB_pairs_s31(uint8_t* lut, const EpdWaveformPhases* phases, int frame) {
+    build_gl16_1ppB_lut_S3_VE_1k(lut, phases, frame);
+    expand_1k_to_pairs_s31(lut);
+}
+
+static void IRAM_ATTR build_equalize_black_1ppB_pairs_s31(
+    uint8_t* lut, const EpdWaveformPhases* phases, int frame
+) {
+    build_equalize_black_1ppB_lut_S3_VE_1k(lut, phases, frame);
+    expand_1k_to_pairs_s31(lut);
+}
+
 __attribute__((optimize("O3"))) static void IRAM_ATTR calc_epd_input_1ppB_pairs_s31(
     const uint32_t* ld, uint8_t* epd_input, const uint8_t* conversion_lut, uint32_t epd_width
 ) {
@@ -559,12 +636,15 @@ LutFunctionPair find_lut_functions(enum EpdDrawMode mode, uint32_t lut_size) {
     pair.lookup_func = NULL;
 
     if (mode & MODE_PACKING_1PPB_DIFFERENCE) {
+        const int waveform_mode = mode & MODE_UNKNOWN_WAVEFORM;
+        const bool keep_black = waveform_mode == MODE_DU;
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
         if (!(mode & MODE_FORCE_NO_PIE) && lut_size >= 1 << 16) {
             pair.build_func = mode & MODE_SKIP_UNCHANGED
-                ? ((mode & MODE_UNKNOWN_WAVEFORM) == MODE_DU
-                    ? &build_du_1ppB_pairs_s31 : &build_changed_1ppB_pairs_s31)
+                ? (waveform_mode == MODE_GL16 ? &build_gl16_1ppB_pairs_s31
+                    : (keep_black ? &build_du_1ppB_pairs_s31 : &build_changed_1ppB_pairs_s31))
                 : &build_1ppB_pairs_s31;
+            if (mode & MODE_EQUALIZE_BLACK) pair.build_func = &build_equalize_black_1ppB_pairs_s31;
             pair.lookup_func = &calc_epd_input_1ppB_pairs_s31;
             return pair;
         }
@@ -572,16 +652,18 @@ LutFunctionPair find_lut_functions(enum EpdDrawMode mode, uint32_t lut_size) {
         if (EPD_CURRENT_RENDER_METHOD == RENDER_METHOD_LCD && !(mode & MODE_FORCE_NO_PIE)
             && lut_size >= 1024) {
             pair.build_func = mode & MODE_SKIP_UNCHANGED
-                ? ((mode & MODE_UNKNOWN_WAVEFORM) == MODE_DU
-                    ? &build_du_1ppB_lut_S3_VE_1k : &build_changed_1ppB_lut_S3_VE_1k)
+                ? (waveform_mode == MODE_GL16 ? &build_gl16_1ppB_lut_S3_VE_1k
+                    : (keep_black ? &build_du_1ppB_lut_S3_VE_1k : &build_changed_1ppB_lut_S3_VE_1k))
                 : &build_1ppB_lut_S3_VE_1k;
+            if (mode & MODE_EQUALIZE_BLACK) pair.build_func = &build_equalize_black_1ppB_lut_S3_VE_1k;
             pair.lookup_func = &calc_epd_input_1ppB_1k_S3_VE;
             return pair;
         } else if (lut_size >= 1 << 16) {
             pair.build_func = mode & MODE_SKIP_UNCHANGED
-                ? ((mode & MODE_UNKNOWN_WAVEFORM) == MODE_DU
-                    ? &build_du_1ppB_lut_64k : &build_changed_1ppB_lut_64k)
+                ? (waveform_mode == MODE_GL16 ? &build_gl16_1ppB_lut_64k
+                    : (keep_black ? &build_du_1ppB_lut_64k : &build_changed_1ppB_lut_64k))
                 : &build_1ppB_lut_64k;
+            if (mode & MODE_EQUALIZE_BLACK) pair.build_func = &build_equalize_black_1ppB_lut_64k;
             pair.lookup_func = &calc_epd_input_1ppB_64k;
             return pair;
         }

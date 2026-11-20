@@ -117,6 +117,8 @@ enum EpdDrawMode {
     // 普通差分刷新屏蔽同色驱动，DU 允许保留黑→黑补黑。
     // 全刷、恢复、测试及调理动画不使用此标记。
     MODE_SKIP_UNCHANGED = 0x8000,
+    // Drive pure-black targets (to == 0) using current waveform's white->black push.
+    MODE_EQUALIZE_BLACK = 0x10000,
 };
 
 /** Display software rotation.

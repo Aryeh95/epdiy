@@ -1,13 +1,19 @@
 #pragma once
-// Read after a stopped scan; no ISR logging is needed for stream diagnosis.
-void epd_lcd_get_stream_stats(int* max_eof_gap_us,int* max_eof_work_us);
-/** @brief 获取已停止扫描的最近一相 LCD 扫描耗时，单位为微秒。 */
-int epd_lcd_get_scan_time_us(void);
-
 #include <driver/gpio.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+// Read after a stopped scan; no ISR logging is needed for stream diagnosis.
+void epd_lcd_get_stream_stats(int* max_eof_gap_us,int* max_eof_work_us);
+/** @brief Read stale bounce refill counters accumulated during the last frame. */
+void epd_lcd_get_stale_stats(uint32_t* stale_refills, int* worst_line);
+/** @brief 获取已停止扫描的最近一相 LCD 扫描耗时，单位为微秒。 */
+int epd_lcd_get_scan_time_us(void);
+/** @brief 获取最近一次 SPV 下降沿时间戳（微秒）。 */
+int64_t epd_lcd_get_spv_start_us(void);
+/** @brief 获取当前实际扫描行数（原生或 8 行对齐）。 */
+int epd_lcd_get_display_lines(void);
 
 /**
  * LCD bus configuration parameters.
@@ -46,6 +52,11 @@ typedef bool (*line_cb_func_t)(void*, uint8_t*);
 typedef void (*frame_done_func_t)(void*);
 
 void epd_lcd_init(const LcdEpdConfig_t* config, int display_width, int display_height);
+/**
+ * @brief Initialize the LCD driver without aborting on failure.
+ * @returns true on success, false if any step fails (rolling back partial state).
+ */
+bool epd_lcd_init_checked(const LcdEpdConfig_t* config, int display_width, int display_height);
 void epd_lcd_deinit();
 void epd_lcd_frame_done_cb(frame_done_func_t, void* payload);
 void epd_lcd_line_source_cb(line_cb_func_t, void* payload);

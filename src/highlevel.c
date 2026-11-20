@@ -202,82 +202,111 @@ EpdRect _inverse_rotated_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     return rotated;
 }
 
-enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area) {
+static enum EpdDrawError update_region(
+    EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area, bool cleanup
+) {
     assert(state != NULL);
-    // Not right to rotate here since this copies part of buffer directly
-
-    // Check rotation FIX
-    EpdRect rotated_area = _inverse_rotated_area(area.x, area.y, area.width, area.height);
-    area.x = rotated_area.x;
-    area.y = rotated_area.y;
-    area.width = rotated_area.width;
-    area.height = rotated_area.height;
+    const bool equalize_black = !cleanup && (mode & MODE_EQUALIZE_BLACK) != 0;
 
     uint32_t ts = esp_timer_get_time() / 1000;
+    const int fb_width = epd_width();
+    const int fb_height = epd_height();
+    const int col_bytes = fb_width / 2;
 
-    // FIXME: use crop information here, if available
-    EpdRect diff_area = epd_difference_image_cropped(
-        state->front_fb,
-        state->back_fb,
-        area,
-        state->difference_fb,
-        state->dirty_lines,
-        state->dirty_columns
-    );
+    int x0 = 0;
+    int x1 = fb_width;
+    int ry0 = 0;
+    int ry1 = fb_height;
 
-    if (diff_area.height == 0 || diff_area.width == 0) {
-        epd_leading_skip_discard();
-        return EPD_DRAW_SUCCESS;
+    if (equalize_black) {
+        epd_difference_image_cropped(
+            state->front_fb,
+            state->back_fb,
+            epd_full_screen(),
+            state->difference_fb,
+            state->dirty_lines,
+            state->dirty_columns
+        );
+    } else {
+        EpdRect rotated_area = _inverse_rotated_area(area.x, area.y, area.width, area.height);
+        int rx0 = rotated_area.x < 0 ? 0 : rotated_area.x;
+        ry0 = rotated_area.y < 0 ? 0 : rotated_area.y;
+        int rx1 = rotated_area.x + rotated_area.width;
+        ry1 = rotated_area.y + rotated_area.height;
+        if (rx1 > fb_width) rx1 = fb_width;
+        if (ry1 > fb_height) ry1 = fb_height;
+        if (rx0 >= rx1 || ry0 >= ry1) {
+            epd_leading_skip_discard();
+            return EPD_DRAW_SUCCESS;
+        }
+        x0 = rx0 & ~31;
+        x1 = (rx1 + 31) & ~31;
+        if (x1 > fb_width) x1 = fb_width;
+        EpdRect clamped = { .x = x0, .y = ry0, .width = x1 - x0, .height = ry1 - ry0 };
+
+        EpdRect diff_area = epd_difference_image_cropped(
+            state->front_fb,
+            state->back_fb,
+            clamped,
+            state->difference_fb,
+            state->dirty_lines,
+            state->dirty_columns
+        );
+
+        // Enforce horizontal column isolation even outside crop_to.
+        if (x0 > 0) memset(state->dirty_columns, 0, (size_t)(x0 / 2));
+        if (x1 < fb_width) memset(state->dirty_columns + (x1 / 2), 0, (size_t)(col_bytes - x1 / 2));
+
+        if (cleanup) {
+            memset(state->dirty_columns + (x0 / 2), 0xFF, (size_t)((x1 - x0) / 2));
+            for (int y = 0; y < fb_height; ++y) {
+                state->dirty_lines[y] = (y >= ry0 && y < ry1);
+            }
+            mode &= ~MODE_SKIP_UNCHANGED;
+        } else {
+            bool any_col = false;
+            for (int c = x0 / 2; c < x1 / 2; ++c) {
+                if (state->dirty_columns[c] != 0) {
+                    any_col = true;
+                    break;
+                }
+            }
+            if (!any_col || diff_area.height == 0 || diff_area.width == 0) {
+                epd_leading_skip_discard();
+                return EPD_DRAW_SUCCESS;
+            }
+        }
     }
 
     uint32_t t1 = esp_timer_get_time() / 1000;
 
-    diff_area.x = 0;
-    diff_area.y = 0;
-    diff_area.width = epd_width();
-    diff_area.height = epd_height();
+    enum EpdDrawMode draw_mode = MODE_PACKING_1PPB_DIFFERENCE | mode;
+    if (!cleanup) {
+        draw_mode |= MODE_SKIP_UNCHANGED;
+    }
 
-    enum EpdDrawError err = EPD_DRAW_SUCCESS;
-    err = epd_draw_base(
+    enum EpdDrawError err = epd_draw_base(
         epd_full_screen(),
         state->difference_fb,
-        diff_area,
-        // 行列掩码较粗，LUT 继续屏蔽未变化像素；DU 仅放行黑→黑补黑。
-        MODE_PACKING_1PPB_DIFFERENCE | MODE_SKIP_UNCHANGED | mode,
+        epd_full_screen(),
+        draw_mode,
         temperature,
-        state->dirty_lines,
-        state->dirty_columns,
+        equalize_black ? NULL : state->dirty_lines,
+        equalize_black ? NULL : state->dirty_columns,
         state->waveform
     );
 
     uint32_t t2 = esp_timer_get_time() / 1000;
 
-    diff_area.x = 0;
-    diff_area.y = 0;
-    diff_area.width = epd_width();
-    diff_area.height = epd_height();
-
-    int buf_width = epd_width();
-
-    for (int l = diff_area.y; err == EPD_DRAW_SUCCESS && l < diff_area.y + diff_area.height; l++) {
-        if (state->dirty_lines[l] > 0) {
-            uint8_t* lfb = state->front_fb + buf_width / 2 * l;
-            uint8_t* lbb = state->back_fb + buf_width / 2 * l;
-
-            int x = diff_area.x;
-            int x_last = diff_area.x + diff_area.width - 1;
-
-            if (x % 2) {
-                *(lbb + x / 2) = (*(lfb + x / 2) & 0xF0) | (*(lbb + x / 2) & 0x0F);
-                x += 1;
+    if (err == EPD_DRAW_SUCCESS) {
+        const int copy_off = x0 / 2;
+        const int copy_bytes = (x1 - x0) / 2;
+        for (int l = ry0; l < ry1; ++l) {
+            if (state->dirty_lines[l]) {
+                memcpy(state->back_fb + col_bytes * l + copy_off,
+                       state->front_fb + col_bytes * l + copy_off,
+                       (size_t)copy_bytes);
             }
-
-            if (!(x_last % 2)) {
-                *(lbb + x_last / 2) = (*(lfb + x_last / 2) & 0x0F) | (*(lbb + x_last / 2) & 0xF0);
-                x_last -= 1;
-            }
-
-            memcpy(lbb + (x / 2), lfb + (x / 2), (x_last - x + 1) / 2);
         }
     }
 
@@ -292,6 +321,14 @@ enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMod
         t3 - ts
     );
     return err;
+}
+
+enum EpdDrawError epd_hl_update_area(EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area) {
+    return update_region(state, mode, temperature, area, false);
+}
+
+enum EpdDrawError epd_hl_update_area_full(EpdiyHighlevelState* state, enum EpdDrawMode mode, int temperature, EpdRect area) {
+    return update_region(state, mode, temperature, area, true);
 }
 
 void epd_hl_set_all_white(EpdiyHighlevelState* state) {

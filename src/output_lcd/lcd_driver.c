@@ -48,6 +48,10 @@ int __DECLARE_RCC_ATOMIC_ENV __attribute__((unused));
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
 #include <esp_private/gdma.h>
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+#include <esp_ipc.h>
+#include <hal/axi_dma_ll.h>
+#endif
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -149,6 +153,7 @@ typedef struct {
 
     int line_length_us;
     int ckv_period_us; // CKV 一行周期；S31 探测拉伸时可大于 line_length_us
+    int ckv_period_ticks;
     uint32_t ckv_tick_hz;
     int line_cycles;
     int lcd_res_h;
@@ -174,7 +179,10 @@ typedef struct {
     int64_t eof_work_max_us;
     int64_t eof_work_sum_us;
     uint32_t eof_work_n;
+    uint32_t stale_refills;
+    int worst_stale_line;
     int64_t frame_t0_us; // lcd_ll_start 时刻，收尾算一相墙钟
+    int64_t spv_start_us;
     int64_t last_frame_us; // 上一相实测时长
     int last_h_hsync;
     int last_h_back;
@@ -185,6 +193,13 @@ typedef struct {
     size_t num_dma_nodes;
     // DMA channel handle
     gdma_channel_handle_t dma_chan;
+    bool dma_connected;
+    bool lcd_initialized;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    axi_dma_dev_t* dma_dev;
+    int dma_channel;
+    int irq_core;
+#endif
     // DMA descriptors pool
     lcd_dma_desc_t* dma_nodes;
 
@@ -203,9 +218,20 @@ typedef struct {
 } s3_lcd_t;
 
 static s3_lcd_t lcd = { 0 };
+
+static bool use_native_scan_timing(const LcdEpdConfig_t* config) {
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    return config->bus_width == 8 && config->dummy_clocks_after_data > 0;
+#else
+    (void)config;
+    return false;
+#endif
+}
+
 static bool border_whitening=false;
 void epd_lcd_prime_white_border(bool enable) { border_whitening=enable; }
 int epd_lcd_white_border_pixels(void) { return lcd.config.white_border_pixels; }
+int epd_lcd_get_display_lines(void) { return lcd.display_lines; }
 
 void IRAM_ATTR epd_lcd_line_source_cb(line_cb_func_t line_source, void* payload) {
     lcd.line_source_cb = line_source;
@@ -217,7 +243,24 @@ void IRAM_ATTR epd_lcd_frame_done_cb(frame_done_func_t cb, void* payload) {
     lcd.frame_cb_payload = payload;
 }
 
-static IRAM_ATTR void lcd_finish_frame_from_isr(void) {
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+static IRAM_ATTR void enable_dma_eof(bool enable) {
+    if (lcd.dma_dev != NULL) {
+        axi_dma_ll_tx_enable_interrupt(lcd.dma_dev, lcd.dma_channel, GDMA_LL_EVENT_TX_EOF, enable);
+    }
+}
+
+static IRAM_ATTR void clear_dma_pending(void) {
+    if (lcd.dma_dev != NULL) {
+        axi_dma_ll_tx_clear_interrupt_status(lcd.dma_dev, lcd.dma_channel, UINT32_MAX);
+    }
+}
+#endif
+
+static IRAM_ATTR void lcd_finish_frame_from_isr(bool notify_frame_done) {
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    enable_dma_eof(false);
+#endif
     if (lcd.frame_finishing) {
         return;
     }
@@ -230,13 +273,32 @@ static IRAM_ATTR void lcd_finish_frame_from_isr(void) {
     lcd_ll_stop(lcd.hal.dev);
     gdma_stop(lcd.dma_chan);
     lcd_ll_clear_interrupt_status(lcd.hal.dev, lcd_ll_get_interrupt_status(lcd.hal.dev));
-    if (lcd.frame_done_cb != NULL) {
+    if (notify_frame_done && lcd.frame_done_cb != NULL) {
         lcd.frame_done_cb(lcd.frame_cb_payload);
     }
 }
 
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+static void abort_frame_on_irq_core(void* arg) {
+    (void)arg;
+    lcd_finish_frame_from_isr(false);
+    gdma_reset(lcd.dma_chan);
+    clear_dma_pending();
+}
+#endif
+
 void epd_lcd_abort_frame(void) {
-    lcd_finish_frame_from_isr();
+    if (!lcd.lcd_initialized) {
+        return;
+    }
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    enable_dma_eof(false);
+    lcd_ll_enable_interrupt(lcd.hal.dev, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE, false);
+    // Synchronize on the IRQ core so any active ISR observes the stop before buffers are reused.
+    ESP_ERROR_CHECK(esp_ipc_call_blocking(lcd.irq_core, abort_frame_on_irq_core, NULL));
+#else
+    lcd_finish_frame_from_isr(false);
+#endif
 }
 
 void epd_lcd_get_stream_stats(int* max_eof_gap_us,int* max_eof_work_us) {
@@ -244,8 +306,17 @@ void epd_lcd_get_stream_stats(int* max_eof_gap_us,int* max_eof_work_us) {
     *max_eof_work_us=(int)lcd.eof_work_max_us;
 }
 
+void epd_lcd_get_stale_stats(uint32_t* stale_refills, int* worst_line) {
+    if (stale_refills != NULL) *stale_refills = lcd.stale_refills;
+    if (worst_line != NULL) *worst_line = lcd.worst_stale_line;
+}
+
 int epd_lcd_get_scan_time_us(void) {
     return (int)lcd.last_frame_us;
+}
+
+int64_t epd_lcd_get_spv_start_us(void) {
+    return lcd.spv_start_us;
 }
 
 static IRAM_ATTR bool fill_bounce_buffer(uint8_t* buffer) {
@@ -309,7 +380,8 @@ static void start_ckv_cycles(int cycles) {
 static void ckv_rmt_build_signal() {
     // 门极一行周期必须等于 LCD 一行时间；若偏短会出现「一行数据多次 CKV」→ 格子被拉扁。
     const int period_us = lcd.ckv_period_us > 0 ? lcd.ckv_period_us : 1;
-    const int period=(int)(((uint64_t)period_us*lcd.ckv_tick_hz+500000)/1000000);
+    const int period = lcd.ckv_period_ticks > 0 ? lcd.ckv_period_ticks :
+        (int)(((uint64_t)period_us*lcd.ckv_tick_hz+500000)/1000000);
     const int minimum=(lcd.ckv_tick_hz+999999)/1000000; // E0470A14-AF: high/low >=1us.
     if (period<2*minimum) return; // init precedes calculating the real line length.
     int high=(int)(((uint64_t)lcd.config.ckv_high_time*lcd.ckv_tick_hz+5000000)/10000000);
@@ -408,6 +480,7 @@ static void deinit_ckv_rmt() {
         rmt_ll_reset_register(0);
         rmt_ll_enable_bus_clock(0, false);
     }
+    esp_clk_tree_enable_src((soc_module_clk_t)RMT_CLK_SRC_DEFAULT, false);
 #else
     periph_module_reset(PERIPH_RMT_MODULE);
     periph_module_disable(PERIPH_RMT_MODULE);
@@ -450,7 +523,7 @@ __attribute__((optimize("O3"))) IRAM_ATTR static void lcd_isr(void* args) {
             esp_rom_delay_us(lcd.ckv_period_us);
             start_ckv_cycles(next_lines + tail_lines);
         } else {
-            lcd_finish_frame_from_isr();
+            lcd_finish_frame_from_isr(true);
         }
     }
 
@@ -467,8 +540,10 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(
         return false;
     }
     const int64_t t0 = esp_timer_get_time();
-    if (lcd.eof_last_us > 0) {
-        const int64_t dt = t0 - lcd.eof_last_us;
+    int64_t dt = 0;
+    const bool have_dt = lcd.eof_last_us > 0;
+    if (have_dt) {
+        dt = t0 - lcd.eof_last_us;
         if (lcd.eof_dt_n == 0) {
             lcd.eof_dt_min_us = dt;
             lcd.eof_dt_max_us = dt;
@@ -493,6 +568,17 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(
     // AXI-GDMA：补数后交还 DMA，否则 check_owner 时描述符停在 CPU
     lcd.dma_nodes[bb].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
     const int64_t work = esp_timer_get_time() - t0;
+    if (have_dt) {
+        const int64_t period = (int64_t)lcd.line_length_us * BOUNCE_BUF_LINES;
+        const int64_t late = (dt > period ? dt - period : 0) + work;
+        if (period > 0 && late > period) {
+            lcd.stale_refills += 1;
+            const int fed_line = (int)lcd.lines_fed;
+            if (lcd.worst_stale_line < 0 || fed_line > lcd.worst_stale_line) {
+                lcd.worst_stale_line = fed_line;
+            }
+        }
+    }
     if (lcd.eof_work_n == 0) {
         lcd.eof_work_min_us = work;
         lcd.eof_work_max_us = work;
@@ -509,7 +595,23 @@ static IRAM_ATTR bool lcd_rgb_panel_eof_handler(
     return awoken;
 }
 
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+static void register_dma_callback_on_irq_core(void* arg) {
+    esp_err_t* result = arg;
+    gdma_tx_event_callbacks_t cbs = {
+        .on_trans_eof = lcd_rgb_panel_eof_handler,
+    };
+    assert(xPortGetCoreID() == lcd.irq_core);
+    *result = gdma_register_tx_event_callbacks(lcd.dma_chan, &cbs, NULL);
+}
+#endif
+
 static esp_err_t init_dma_trans_link() {
+    lcd.dma_chan = NULL;
+    lcd.dma_connected = false;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    lcd.dma_dev = NULL;
+#endif
     lcd.dma_nodes[0].dw0.suc_eof = 1;
     lcd.dma_nodes[0].dw0.size = lcd.bb_size;
     lcd.dma_nodes[0].dw0.length = lcd.bb_size;
@@ -545,11 +647,14 @@ static esp_err_t init_dma_trans_link() {
 #endif
     gdma_trigger_t trigger = GDMA_MAKE_TRIGGER(GDMA_TRIG_PERIPH_LCD, 0);
     ESP_RETURN_ON_ERROR(gdma_connect(lcd.dma_chan, trigger), TAG, "dma connect error");
+    lcd.dma_connected = true;
+
+    ESP_RETURN_ON_ERROR(gdma_set_priority(lcd.dma_chan, 5), TAG, "dma priority error");
 
     gdma_strategy_config_t dma_strategy = {
         .eof_till_data_popped = false,
     };
-    gdma_apply_strategy(lcd.dma_chan, &dma_strategy);
+    ESP_RETURN_ON_ERROR(gdma_apply_strategy(lcd.dma_chan, &dma_strategy), TAG, "dma strategy error");
 
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 0, 0)
     /* bounce 在内部 SRAM，勿开 ext_mem，避免 AXI 误触 PSRAM 对齐检查 */
@@ -566,20 +671,42 @@ static esp_err_t init_dma_trans_link() {
     ESP_RETURN_ON_ERROR(gdma_set_transfer_ability(lcd.dma_chan, &ability), TAG, "dma setup error");
 #endif
 
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    int dma_group;
+    ESP_RETURN_ON_ERROR(gdma_get_group_channel_id(lcd.dma_chan, &dma_group, &lcd.dma_channel),
+        TAG, "get DMA group/channel failed");
+    lcd.dma_dev = AXI_DMA_LL_GET_HW(dma_group - GDMA_LL_AXI_GROUP_START_ID);
+    esp_err_t callback_result = ESP_FAIL;
+    ESP_RETURN_ON_ERROR(esp_ipc_call_blocking(lcd.irq_core,
+        register_dma_callback_on_irq_core, &callback_result), TAG, "register DMA callback IPC failed");
+    ESP_RETURN_ON_ERROR(callback_result, TAG, "register DMA callback failed");
+    enable_dma_eof(false);
+#else
     gdma_tx_event_callbacks_t cbs = {
         .on_trans_eof = lcd_rgb_panel_eof_handler,
     };
     ESP_RETURN_ON_ERROR(
         gdma_register_tx_event_callbacks(lcd.dma_chan, &cbs, NULL), TAG, "dma setup error"
     );
+#endif
 
     return ESP_OK;
 }
 
 void deinit_dma_trans_link() {
-    gdma_reset(lcd.dma_chan);
-    gdma_disconnect(lcd.dma_chan);
+    if (lcd.dma_chan == NULL) {
+        return;
+    }
+    if (lcd.dma_connected) {
+        gdma_reset(lcd.dma_chan);
+        gdma_disconnect(lcd.dma_chan);
+        lcd.dma_connected = false;
+    }
     gdma_del_channel(lcd.dma_chan);
+    lcd.dma_chan = NULL;
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    lcd.dma_dev = NULL;
+#endif
 }
 
 /**
@@ -712,22 +839,28 @@ static void assign_lcd_parameters_from_config(
     assert(config->white_border_pixels*2<display_width && config->white_border_pixels*2<display_height);
     lcd.native_height=display_height;
 
-    // Make sure the bounce buffers divide the display height evenly.
-    lcd.display_lines = (((display_height + 7) / 8) * 8);
+    // Native height with zero-padded tail bounce avoids scanning phantom off-panel rows.
+    lcd.display_lines = use_native_scan_timing(config) ? display_height :
+        (((display_height + 7) / 8) * 8);
 
     lcd.line_bytes = display_width / 4;
     lcd.lcd_res_h = lcd.line_bytes / (lcd.config.bus_width / 8);
 
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    lcd.dummy_bytes = 0;
+#else
     // With 8 bit bus width, we need a dummy cycle before the actual data,
     // because the LCD peripheral behaves weirdly.
     // Also see:
     // https://blog.adafruit.com/2022/06/14/esp32uesday-hacking-the-esp32-s3-lcd-peripheral/
     lcd.dummy_bytes = lcd.config.bus_width / 8;
+#endif
 
     // each bounce buffer holds a number of lines with data + dummy bytes each
     lcd.bb_size = BOUNCE_BUF_LINES * (lcd.line_bytes + lcd.dummy_bytes);
     lcd.line_length_us = 1;
     lcd.ckv_period_us = 1;
+    lcd.ckv_period_ticks = 0;
 
     check_cache_configuration();
 
@@ -796,13 +929,21 @@ static void free_lcd_buffers() {
  */
 static esp_err_t init_lcd_peripheral() {
     esp_err_t ret = ESP_OK;
+    lcd.lcd_intr = NULL;
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
+#ifdef lcd_ll_select_core_clk_src
+    esp_clk_tree_enable_src((soc_module_clk_t)LCD_CORE_CLK_SRC_DEFAULT, true);
+#endif
     // 与 esp_lcd RGB 一致：RCC 引用计数开总线时钟，并打开 RGB 传输缓冲
     PERIPH_RCC_ACQUIRE_ATOMIC(LCD_PERIPH_PANEL.module, ref_count) {
         if (ref_count == 0) {
             lcd_ll_enable_bus_clock(0, true);
             lcd_ll_reset_register(0);
+#ifdef lcd_ll_select_core_clk_src
+            lcd_ll_select_core_clk_src(0, LCD_CORE_CLK_SRC_DEFAULT);
+            lcd_ll_set_core_clock_divider(0, 2, 0, 0);
+#endif
         }
     }
     lcd_hal_init(&lcd.hal, 0);
@@ -844,7 +985,13 @@ static esp_err_t init_lcd_peripheral() {
         source, flags, status, LCD_LL_EVENT_VSYNC_END | LCD_LL_EVENT_TRANS_DONE,
         lcd_isr, NULL, &lcd.lcd_intr
     );
-    ESP_RETURN_ON_ERROR(ret, TAG, "install interrupt failed");
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "install interrupt failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    lcd.irq_core = esp_intr_get_cpu(lcd.lcd_intr);
+#endif
 
     lcd_ll_fifo_reset(lcd.hal.dev);
     lcd_ll_reset(lcd.hal.dev);
@@ -898,24 +1045,35 @@ static esp_err_t init_lcd_peripheral() {
 
 static void deinit_lcd_peripheral() {
     // disable and free interrupts
-    esp_intr_disable(lcd.lcd_intr);
-    esp_intr_free(lcd.lcd_intr);
+    if (lcd.lcd_intr != NULL) {
+        esp_intr_disable(lcd.lcd_intr);
+        esp_intr_free(lcd.lcd_intr);
+        lcd.lcd_intr = NULL;
+    }
 
-    lcd_ll_fifo_reset(lcd.hal.dev);
-    lcd_ll_reset(lcd.hal.dev);
+    if (lcd.hal.dev != NULL) {
+        lcd_ll_fifo_reset(lcd.hal.dev);
+        lcd_ll_reset(lcd.hal.dev);
 #if defined(CONFIG_IDF_TARGET_ESP32S31) || defined(CONFIG_IDF_TARGET_ESP32P4)
-    lcd_ll_enable_trans_buffer(lcd.hal.dev, false);
+        lcd_ll_enable_trans_buffer(lcd.hal.dev, false);
 #endif
+    }
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
-    PERIPH_RCC_ATOMIC() {
-        lcd_ll_enable_clock(lcd.hal.dev, false);
+    if (lcd.hal.dev != NULL) {
+        PERIPH_RCC_ATOMIC() {
+            lcd_ll_enable_clock(lcd.hal.dev, false);
+        }
     }
     PERIPH_RCC_RELEASE_ATOMIC(LCD_PERIPH_PANEL.module, ref_count) {
         if (ref_count == 0) {
             lcd_ll_enable_bus_clock(0, false);
         }
     }
+    esp_clk_tree_enable_src((soc_module_clk_t)LCD_CLK_SRC_DEFAULT, false);
+#ifdef lcd_ll_select_core_clk_src
+    esp_clk_tree_enable_src((soc_module_clk_t)LCD_CORE_CLK_SRC_DEFAULT, false);
+#endif
 #else
     periph_module_reset(PERIPH_LCD_CAM_MODULE);
     periph_module_disable(PERIPH_LCD_CAM_MODULE);
@@ -923,50 +1081,85 @@ static void deinit_lcd_peripheral() {
 }
 
 /**
- * Configure the LCD driver for epdiy.
+ * Configure the LCD driver for epdiy without aborting on failure.
  */
-void epd_lcd_init(const LcdEpdConfig_t* config, int display_width, int display_height) {
+bool epd_lcd_init_checked(const LcdEpdConfig_t* config, int display_width, int display_height) {
+    if (config == NULL) {
+        return false;
+    }
+    if (lcd.lcd_initialized) {
+        return true;
+    }
+
     esp_err_t ret = ESP_OK;
+    bool buffers_allocated = false;
+    bool periph_initialized = false;
+    bool dma_initialized = false;
+    bool gpio_initialized = false;
+    bool rmt_initialized = false;
+
     assign_lcd_parameters_from_config(config, display_width, display_height);
 
     check_cache_configuration();
 
     ret = allocate_lcd_buffers();
     ESP_GOTO_ON_ERROR(ret, err, TAG, "lcd buffer allocation failed");
+    buffers_allocated = true;
 
+    periph_initialized = true;
     ret = init_lcd_peripheral();
     ESP_GOTO_ON_ERROR(ret, err, TAG, "lcd peripheral init failed");
 
+    dma_initialized = true;
     ret = init_dma_trans_link();
     ESP_GOTO_ON_ERROR(ret, err, TAG, "install DMA failed");
 
+    gpio_initialized = true;
     ret = init_bus_gpio();
     ESP_GOTO_ON_ERROR(ret, err, TAG, "configure GPIO failed");
 
     init_ckv_rmt();
+    rmt_initialized = true;
 
     // setup driver state
     epd_lcd_set_pixel_clock_MHz(lcd.config.pixel_clock / 1000 / 1000);
     epd_lcd_line_source_cb(NULL, NULL);
+    lcd.lcd_initialized = true;
 
     ESP_LOGI(TAG, "LCD init done.");
-    return;
+    return true;
 err:
-    ESP_LOGE(TAG, "LCD initialization failed!");
-    abort();
+    ESP_LOGE(TAG, "LCD initialization failed: %s", esp_err_to_name(ret));
+    if (rmt_initialized) deinit_ckv_rmt();
+    if (gpio_initialized) deinit_bus_gpio();
+    if (dma_initialized) deinit_dma_trans_link();
+    if (periph_initialized) deinit_lcd_peripheral();
+    if (buffers_allocated) free_lcd_buffers();
+    return false;
+}
+
+void epd_lcd_init(const LcdEpdConfig_t* config, int display_width, int display_height) {
+    if (!epd_lcd_init_checked(config, display_width, display_height)) {
+        abort();
+    }
 }
 
 /**
  * Deinitializue the LCD driver, i.e., free resources and peripherals.
  */
 void epd_lcd_deinit() {
+    if (!lcd.lcd_initialized) {
+        return;
+    }
     epd_lcd_line_source_cb(NULL, NULL);
+    epd_lcd_frame_done_cb(NULL, NULL);
 
     deinit_bus_gpio();
     deinit_lcd_peripheral();
     deinit_dma_trans_link();
     free_lcd_buffers();
     deinit_ckv_rmt();
+    lcd.lcd_initialized = false;
 
     ESP_LOGI(TAG, "LCD deinitialized.");
 }
@@ -1044,6 +1237,7 @@ void epd_lcd_set_pixel_clock_MHz(int frequency) {
     lcd.line_cycles = lcd.line_length_us * pclk / 1000000;
     // EOF 逐脉冲对比度崩；×2/×6 自由跑会撕成多列。先 1:1 自由跑保清晰，拉伸另查。
     lcd.ckv_period_us = lcd.line_length_us;
+    lcd.ckv_period_ticks = 0;
     if (lcd.config.dummy_clocks_after_data) {
         // Apply Pico's data-window calculation to our 8-bit bus. Keep this
         // panel's >=1us low interval and ten post-data clocks (not Pico's pins
@@ -1052,20 +1246,41 @@ void epd_lcd_set_pixel_clock_MHz(int frequency) {
         const int data_end=(int)(((int64_t)data_clocks*10000000+pclk-1)/pclk);
         lcd.config.ckv_high_time=max(10,min(data_end,lcd.line_length_us*10-10));
     }
-    ESP_LOGI(TAG, "line width: %dus, %d cycles", lcd.line_length_us, lcd.line_cycles);
+    if (use_native_scan_timing(&lcd.config) && lcd.ckv_tick_hz == 10000000
+        && pclk % lcd.ckv_tick_hz == 0) {
+        const int cycles_per_tick = pclk / lcd.ckv_tick_hz;
+        const int data_clocks = lcd.lcd_res_h + lcd.config.le_high_time
+            + lcd.config.line_front_porch;
+        const int high_ticks = (data_clocks + cycles_per_tick - 1) / cycles_per_tick;
+        const int minimum_low_ticks = lcd.ckv_tick_hz / 1000000;
+        const int minimum_cycles = data_clocks + lcd.config.dummy_clocks_after_data;
+        const int period_ticks = max(high_ticks + minimum_low_ticks,
+            (minimum_cycles + cycles_per_tick - 1) / cycles_per_tick);
+        // Share exact sub-microsecond period between LCD and RMT without drift.
+        lcd.ckv_period_ticks = period_ticks;
+        lcd.line_cycles = period_ticks * cycles_per_tick;
+        lcd.line_length_us = (period_ticks + minimum_low_ticks - 1) / minimum_low_ticks;
+        lcd.ckv_period_us = lcd.line_length_us;
+        lcd.config.ckv_high_time = high_ticks;
+    }
+    const int line_time_100ns = (int)((int64_t)lcd.line_cycles * 10000000 / pclk);
+    ESP_LOGI(TAG, "line width: %d.%dus, %d cycles", line_time_100ns / 10,
+        line_time_100ns % 10, lcd.line_cycles);
 
     ckv_rmt_build_signal();
-    ESP_LOGI("EpdTiming", "line=%dus CKV high=%d.%dus low=%d.%dus tail=%d clocks RMT=%uHz",
-        lcd.ckv_period_us,lcd.config.ckv_high_time/10,lcd.config.ckv_high_time%10,
-        (lcd.ckv_period_us*10-lcd.config.ckv_high_time)/10,
-        (lcd.ckv_period_us*10-lcd.config.ckv_high_time)%10,
+    ESP_LOGI("EpdTiming", "line=%d.%dus CKV high=%d.%dus low=%d.%dus tail=%d clocks RMT=%uHz",
+        line_time_100ns/10,line_time_100ns%10,
+        lcd.config.ckv_high_time/10,lcd.config.ckv_high_time%10,
+        (line_time_100ns-lcd.config.ckv_high_time)/10,
+        (line_time_100ns-lcd.config.ckv_high_time)%10,
         lcd.line_cycles-lcd.lcd_res_h-lcd.config.le_high_time-lcd.config.line_front_porch,
         (unsigned)lcd.ckv_tick_hz);
     ESP_LOGI(TAG,
              "PROBE bounce=%d always_on=%d d0_toggle=%d | expect EOF≈%dus | scope: D0=GPIO8 "
              "XCL=GPIO%d XLE=GPIO%d CKV=GPIO%d",
              EPD_LCD_PROBE_BOUNCE, EPD_LCD_PROBE_ALWAYS_ON, EPD_LCD_PROBE_D0_TOGGLE,
-             lcd.line_length_us * EPD_LCD_PROBE_BOUNCE, (int)lcd.config.bus.clock,
+             (int)((int64_t)lcd.line_cycles * EPD_LCD_PROBE_BOUNCE * 1000000 / pclk),
+             (int)lcd.config.bus.clock,
              (int)lcd.config.bus.leh, (int)lcd.config.bus.ckv);
 }
 
@@ -1123,9 +1338,11 @@ void IRAM_ATTR epd_lcd_start_frame() {
     if (lcd.eof_dt_n > 0 && s_timing_logs < 1) {
         s_timing_logs++;
         const int64_t avg = lcd.eof_dt_sum_us / (int64_t)lcd.eof_dt_n;
-        const int expect = lcd.line_length_us * BOUNCE_BUF_LINES;
+        const int expect = (int)((int64_t)lcd.line_cycles * BOUNCE_BUF_LINES * 1000000
+            / lcd.config.pixel_clock);
         const int meas_line = BOUNCE_BUF_LINES > 0 ? (int)(avg / BOUNCE_BUF_LINES) : 0;
-        const int theory_frame = lcd.line_length_us * lcd.display_lines;
+        const int theory_frame = (int)((int64_t)lcd.line_cycles * lcd.display_lines * 1000000
+            / lcd.config.pixel_clock);
         const int factor_x100 = expect > 0 ? (int)((avg * 100) / expect) : 0;
         ESP_LOGD(TAG,
                  "timing: frame=%lldus lines=%d | soft line=%dus theory_frame=%dus | "
@@ -1156,11 +1373,18 @@ void IRAM_ATTR epd_lcd_start_frame() {
     lcd_ll_set_hsync_position(lcd.hal.dev, 1);
 
     // reset FIFO of DMA and LCD, incase there remains old frame data
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    enable_dma_eof(false);
+#endif
     gdma_reset(lcd.dma_chan);
     lcd_ll_stop(lcd.hal.dev);
     lcd_ll_clear_interrupt_status(lcd.hal.dev, lcd_ll_get_interrupt_status(lcd.hal.dev));
     lcd_ll_fifo_reset(lcd.hal.dev);
     lcd_ll_enable_auto_next_frame(lcd.hal.dev, lcd.display_lines > LINE_BATCH);
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    // Discard any pending EOF accumulated while stopped before publishing new phase state.
+    clear_dma_pending();
+#endif
 
     lcd.batches = 0;
     lcd.bb_eof_count = 0;
@@ -1175,6 +1399,8 @@ void IRAM_ATTR epd_lcd_start_frame() {
     lcd.eof_work_max_us = 0;
     lcd.eof_work_sum_us = 0;
     lcd.eof_work_n = 0;
+    lcd.stale_refills = 0;
+    lcd.worst_stale_line = -1;
     lcd.frame_t0_us = 0;
     fill_bounce_buffer(lcd.bounce_buffer[0]);
     fill_bounce_buffer(lcd.bounce_buffer[1]);
@@ -1182,6 +1408,9 @@ void IRAM_ATTR epd_lcd_start_frame() {
     lcd.dma_nodes[1].dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
 
     // the start of DMA should be prior to the start of LCD engine
+#if defined(CONFIG_IDF_TARGET_ESP32S31)
+    enable_dma_eof(true);
+#endif
     gdma_start(lcd.dma_chan, (intptr_t)&lcd.dma_nodes[0]);
 
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
@@ -1206,6 +1435,7 @@ void IRAM_ATTR epd_lcd_start_frame() {
 
     // delay 1us is sufficient for DMA to pass data to LCD FIFO
     // in fact, this is only needed when LCD pixel clock is set too high
+    lcd.spv_start_us = esp_timer_get_time();
     gpio_set_level(lcd.config.bus.stv, 0);
     // esp_rom_delay_us(1);
     //  for picture clarity, it seems to be important to start CKV at a "good"
@@ -1213,7 +1443,9 @@ void IRAM_ATTR epd_lcd_start_frame() {
     start_ckv_cycles(initial_lines + 5);
     esp_rom_delay_us(lcd.ckv_period_us);
     gpio_set_level(lcd.config.bus.stv, 1);
+#if !defined(CONFIG_IDF_TARGET_ESP32S31)
     esp_rom_delay_us(lcd.ckv_period_us);
+#endif
     esp_rom_delay_us(lcd.config.ckv_high_time / 10);
 
     // start LCD engine

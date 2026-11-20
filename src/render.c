@@ -28,7 +28,10 @@
 #ifdef RENDER_METHOD_I2S
 #include "output_i2s/render_i2s.h"
 #endif
+#ifdef RENDER_METHOD_LCD
+#include "output_lcd/lcd_driver.h"
 #include "output_lcd/render_lcd.h"
+#endif
 
 static inline int min(int x, int y) {
     return x < y ? x : y;
@@ -203,6 +206,9 @@ __attribute__((optimize("O3"))) static void mark_present_line(
 static int leading_skip_frames(
     const EpdWaveformPhases* phases, const uint8_t* data, EpdRect area, enum EpdDrawMode mode
 ) {
+    if (mode & MODE_EQUALIZE_BLACK) {
+        return 0;
+    }
     // Rebuilt every draw (cheap): a waveform table may be rewritten in place.
     build_first_active(phases);
     if (s_present_for != data) {
@@ -223,10 +229,19 @@ static int leading_skip_frames(
     return skip < 0 ? 0 : skip;
 }
 
-/// Rounded up display height for even division into multi-line buffers.
-static inline int rounded_display_height() {
+/// Actual active scan height (native height on S31 LCD, or 8-row aligned fallback).
+static inline int scan_display_height(void) {
+#ifdef RENDER_METHOD_LCD
+    const int lines = epd_lcd_get_display_lines();
+    if (lines > 0) return lines;
+#endif
     return (((epd_height() + 7) / 8) * 8);
 }
+
+#if defined(CONFIG_IDF_TARGET_ESP32S31) && defined(RENDER_METHOD_LCD)
+static DRAM_ATTR uint8_t s_spatial_luts[10 * 256];
+static DRAM_ATTR uint8_t s_spatial_bands[1280];
+#endif
 
 // FIXME: fix misleading naming:
 //  area -> buffer dimensions
@@ -312,13 +327,11 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
         const int orient=(mode>>13)&3;
         render_context.spatial_by_y=orient==0 || orient==3;
         const int axis=render_context.spatial_by_y ? epd_height() : epd_width();
-        render_context.spatial_luts=heap_caps_malloc(10*256,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-        render_context.spatial_bands=heap_caps_malloc(axis,MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-        if(!render_context.spatial_luts || !render_context.spatial_bands) {
-            free(render_context.spatial_luts);free(render_context.spatial_bands);
-            render_context.spatial_luts=render_context.spatial_bands=NULL;
-            return EPD_DRAW_FAILED_ALLOC;
+        if (axis > (int)sizeof(s_spatial_bands)) {
+            return EPD_DRAW_INVALID_CROP;
         }
+        render_context.spatial_luts = s_spatial_luts;
+        render_context.spatial_bands = s_spatial_bands;
         epd_spatial_bands(render_context.spatial_bands,axis,orient==0 || orient==2);
         frame_count+=9;
 #else
@@ -340,7 +353,7 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
 
     render_context.lines_prepared = 0;
     render_context.lines_consumed = 0;
-    render_context.lines_total = rounded_display_height();
+    render_context.lines_total = scan_display_height();
     int skip = 0;
     if (s_leading_skip_enabled && waveform_phases != NULL && waveform_phases->phases > 1
         && (mode & MODE_PACKING_1PPB_DIFFERENCE) && !render_context.spatial_luts) {
@@ -357,9 +370,12 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
     }
     if(render_context.spatial_luts) render_context.phase_times=NULL;
 
-    epd_populate_line_mask(
-        render_context.line_mask, drawn_columns, render_context.display_width / 4
-    );
+    render_context.line_mask_active = (drawn_columns != NULL);
+    if (render_context.line_mask_active) {
+        epd_populate_line_mask(
+            render_context.line_mask, drawn_columns, render_context.display_width / 4
+        );
+    }
 
 #ifdef RENDER_METHOD_I2S
     i2s_do_update(&render_context);
@@ -369,7 +385,6 @@ enum EpdDrawError IRAM_ATTR epd_draw_base(
 
     report_prep_stack_watermarks();
 
-    free(render_context.spatial_luts);free(render_context.spatial_bands);
     render_context.spatial_luts=render_context.spatial_bands=NULL;
     if (render_context.error & EPD_DRAW_EMPTY_LINE_QUEUE) {
         ESP_LOGE("epdiy", "line buffer underrun occurred!");
@@ -484,18 +499,24 @@ void epd_renderer_init(enum EpdInitOptions options) {
     render_context.static_line_buffer = NULL;
 
     render_context.frame_done = xSemaphoreCreateBinary();
+    assert(render_context.frame_done != NULL);
+    render_context.prefill_done = xSemaphoreCreateCounting(NUM_RENDER_THREADS, 0);
+    assert(render_context.prefill_done != NULL);
 
     for (int i = 0; i < NUM_RENDER_THREADS; i++) {
         render_context.feed_done_smphr[i] = xSemaphoreCreateBinary();
+        assert(render_context.feed_done_smphr[i] != NULL);
+        render_context.feed_space[i] = xSemaphoreCreateBinary();
+        assert(render_context.feed_space[i] != NULL);
+        atomic_init(&render_context.feed_waiting[i], false);
     }
 
-    // When using the LCD peripheral, we may need padding lines to
-    // satisfy the bounce buffer size requirements
+    // When using the LCD peripheral, allocate line tracking for active scan height.
     render_context.line_threads = (uint8_t*)heap_caps_malloc(
-        rounded_display_height(), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL
+        scan_display_height(), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL
     );
     assert(render_context.line_threads != NULL);
-    render_context.line_ready=heap_caps_calloc(rounded_display_height(),1,MALLOC_CAP_INTERNAL);
+    render_context.line_ready=heap_caps_calloc(scan_display_height(),1,MALLOC_CAP_INTERNAL);
     assert(render_context.line_ready!=NULL);
 
     int queue_len = 32;
@@ -554,7 +575,7 @@ void epd_renderer_init(enum EpdInitOptions options) {
     const size_t elem_aligned = ((queue_elem_size + 15) / 16) * 16;
     const size_t line_q_bytes =
         (size_t)NUM_RENDER_THREADS * (size_t)queue_len * elem_aligned;
-    const size_t line_threads_bytes = (size_t)rounded_display_height();
+    const size_t line_threads_bytes = (size_t)scan_display_height();
     const size_t line_mask_bytes = (size_t)epd_width() / 4;
     ESP_LOGD("epd_dram",
 #if defined(CONFIG_IDF_TARGET_ESP32S31)
@@ -578,7 +599,9 @@ void epd_renderer_deinit() {
         }
         lq_free(&render_context.line_queues[i]);
         vSemaphoreDelete(render_context.feed_done_smphr[i]);
+        vSemaphoreDelete(render_context.feed_space[i]);
     }
+    vSemaphoreDelete(render_context.prefill_done);
 
 #ifdef RENDER_METHOD_I2S
     i2s_deinit();

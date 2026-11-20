@@ -9,6 +9,10 @@ extern const EpdWaveform MY_WAVEFORM;
 void my_waveform_init(void);
 // Balanced: trimmed GC/GL (36/37 phases), unchanged DU; NULL if unavailable.
 const EpdWaveform* my_waveform_fast(void);
+// Clean-room cross-fade reader waveform: left-aligned transitions without full white pre-flash
+// and 5+5 black retention pulse on 0->0. Do NOT use when display content is inverted (Night Mode).
+#define MY_WAVEFORM_HAS_READER 1
+const EpdWaveform* my_waveform_reader(void);
 // Tunable 16-level GC, for calibrating gray levels on the glass. Every pixel
 // that changes is first cleared to white and then driven to its level from
 // white, so each level is defined by its own three numbers. levels[] is

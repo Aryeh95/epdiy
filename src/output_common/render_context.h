@@ -29,8 +29,10 @@ typedef struct {
     volatile int lines_consumed;
     int lines_total;
 
-    /// frame currently in the current update cycle
+    /// frame currently prepared / feeding in the update cycle
     int current_frame;
+    /// frame currently scanning on LCD (allows lookahead preparation of next phase)
+    int scan_frame;
     /// number of frames in the current update cycle
     int cycle_frames;
     // First streaming fault; written without logging/allocation in the ISR.
@@ -39,6 +41,9 @@ typedef struct {
 
     TaskHandle_t feed_tasks[NUM_RENDER_THREADS];
     SemaphoreHandle_t feed_done_smphr[NUM_RENDER_THREADS];
+    SemaphoreHandle_t feed_space[NUM_RENDER_THREADS];
+    atomic_bool feed_waiting[NUM_RENDER_THREADS];
+    SemaphoreHandle_t prefill_done;
     SemaphoreHandle_t frame_done;
     // Set by the update owner; feeders must acknowledge through feed_done
     // before any per-update buffer can be released or reused.
@@ -79,6 +84,7 @@ typedef struct {
 
     // Output line mask
     uint8_t* line_mask;
+    bool line_mask_active;
 
     /// track line skipping when working in old i2s mode
     int skipping;
